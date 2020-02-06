@@ -1,0 +1,176 @@
+from econ_helper.eh_conf import *
+from econ_helper.eh_node_base import *
+from nodeeditor.node_edge import EDGE_TYPE_DIRECT, EDGE_TYPE_BEZIER
+from nodeeditor.node_editor_widget import NodeEditorWidget
+from nodeeditor.utils import dumpException
+
+
+class EcoHelperSubWindow(NodeEditorWidget):
+    def __init__(self):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        self.setTitle()
+
+        self.initNewNodeActions()
+
+        self.scene.addHasBeenModifiedListener(self.setTitle)
+        self.scene.addDragEnterListener(self.onDragEnter)
+        self.scene.addDropListener(self.onDrop)
+        self.scene.setNodeClassSelector(self.getNodeClassFromData)
+
+        self._close_event_listeners = []
+
+    def getNodeClassFromData(self, data):
+        if 'op_code' not in data: return Node
+        if 'type_code' not in data: return Node
+        return get_class_from_opcode(data['op_code'], data['type_code'])
+
+    def fileLoad(self, filename):
+        if super().fileLoad(filename):
+            # eval all output nodes
+            for node in self.scene.nodes:
+                if len(node.getChildrenNodes()) == 0:
+                    node.eval()
+            return True
+
+        return False
+
+    def initNewNodeActions(self):
+        self.node_actions = {}
+        keys = list(ECO_NODES.keys())
+        keys.sort()
+        for tc in keys:
+            for key in ECO_NODES[tc].keys():
+                node = ECO_NODES[tc][key]
+                self.node_actions[node.op_code] = QAction(QIcon(node.icon), node.op_title)
+                self.node_actions[node.op_code].setData(node.op_code)
+
+    def initNodesContextMenu(self):
+        context_menu = QMenu(self)
+        keys = list(ECO_NODES.keys())
+        keys.sort()
+        for tc in keys:
+            for key in ECO_NODES[tc].keys():
+                context_menu.addAction(self.node_actions[key])
+        return context_menu
+
+    def setTitle(self):
+        self.setWindowTitle(self.getUserFriendlyFilename())
+
+    def addCloseEventListener(self, callback):
+        self._close_event_listeners.append(callback)
+
+    def closeEvent(self, event):
+        for callback in self._close_event_listeners: callback(self, event)
+
+    def onDragEnter(self, event):
+        if event.mimeData().hasFormat(LISTBOX_MIMETYPE):
+            event.acceptProposedAction()
+        else:
+            event.setAccepted(False)
+
+    def onDrop(self, event):
+        if event.mimeData().hasFormat(LISTBOX_MIMETYPE):
+            eventData = event.mimeData().data(LISTBOX_MIMETYPE)
+            dataStream = QDataStream(eventData, QIODevice.ReadOnly)
+            pixmap = QPixmap()
+            dataStream >> pixmap
+            op_code = dataStream.readQString()
+            type_code = dataStream.readQString()
+            text = dataStream.readQString()
+
+            mouse_position = event.pos()
+            scene_position = self.scene.grScene.views()[0].mapToScene(mouse_position)
+
+            logging.debug(f"GOT DROP: [{op_code}] '{text}', mouse: {mouse_position}, scene: {scene_position}" )
+
+            try:
+                node = get_class_from_opcode(op_code, type_code)(self.scene)
+                node.setPos(scene_position.x(), scene_position.y())
+                self.scene.history.storeHistory("Created node %s" % node.__class__.__name__)
+            except Exception as e: dumpException(e)
+
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+
+    def contextMenuEvent(self, event):
+        try:
+            item = self.scene.getItemAt(event.pos())
+            logging.debug(item)
+
+            if type(item) == QGraphicsProxyWidget:
+                item = item.widget()
+
+            if hasattr(item, 'node') or hasattr(item, 'socket'):
+                self.handleNodeContextMenu(event)
+            elif hasattr(item, 'edge'):
+                self.handleEdgeContextMenu(event)
+            #elif item is None:
+            else:
+                self.handleNewNodeContextMenu(event)
+
+            return super().contextMenuEvent(event)
+        except Exception as e: dumpException(e)
+
+    def handleNodeContextMenu(self, event):
+        logging.debug("CONTEXT: NODE")
+        context_menu = QMenu(self)
+        markDirtyAct = context_menu.addAction("Mark Dirty")
+        markDirtyDescendantsAct = context_menu.addAction("Mark Descendant Dirty")
+        markInvalidAct = context_menu.addAction("Mark Invalid")
+        unmarkInvalidAct = context_menu.addAction("Unmark Invalid")
+        evalAct = context_menu.addAction("Eval")
+        action = context_menu.exec_(self.mapToGlobal(event.pos()))
+
+        selected = None
+        item = self.scene.getItemAt(event.pos())
+        if type(item) == QGraphicsProxyWidget:
+            item = item.widget()
+
+        if hasattr(item, 'node'):
+            selected = item.node
+        if hasattr(item, 'socket'):
+            selected = item.socket.node
+
+        logging.debug(f"got item: {selected}")
+        if selected and action == markDirtyAct: selected.markDirty()
+        if selected and action == markDirtyDescendantsAct: selected.markDescendantsDirty()
+        if selected and action == markInvalidAct: selected.markInvalid()
+        if selected and action == unmarkInvalidAct: selected.markInvalid(False)
+        if selected and action == evalAct:
+            val = selected.eval()
+            logging.debug(f"EVALUATED: {val}")
+
+
+    def handleEdgeContextMenu(self, event):
+        logging.debug("CONTEXT: EDGE")
+        context_menu = QMenu(self)
+        bezierAct = context_menu.addAction("Bezier Edge")
+        directAct = context_menu.addAction("Direct Edge")
+        action = context_menu.exec_(self.mapToGlobal(event.pos()))
+
+        selected = None
+        item = self.scene.getItemAt(event.pos())
+        if hasattr(item, 'edge'):
+            selected = item.edge
+
+        if selected and action == bezierAct: selected.edge_type = EDGE_TYPE_BEZIER
+        if selected and action == directAct: selected.edge_type = EDGE_TYPE_DIRECT
+
+
+    def handleNewNodeContextMenu(self, event):
+        logging.debug("CONTEXT: EMPTY SPACE")
+        context_menu = self.initNodesContextMenu()
+        action = context_menu.exec_(self.mapToGlobal(event.pos()))
+
+        if action is not None:
+            new_eco_node = get_class_from_opcode(action.data())(self.scene)
+            scene_pos = self.scene.getView().mapToScene(event.pos())
+            new_eco_node.setPos(scene_pos.x(), scene_pos.y())
+            logging.debug("Selected node:", new_eco_node)
+
+
